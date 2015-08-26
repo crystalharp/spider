@@ -5,26 +5,37 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"runtime"
 	"strings"
 	"time"
+    "sync"
+    "runtime"
 )
 
 type Spider struct {
-	MaxLevel    int
-	RatePerSite int
-	downBytes   map[string]int
+	maxLevel int
+    ratePerSite int
+    downBytes   map[string]int
+    lock sync.RWMutex
 }
 
 type urlInfo struct {
-	Level int
-	Url   string
+	level int
+	url string
 	retry int
 }
 
+func NewSpider(maxLevel int, ratePerSite int) Spider {
+    spider := Spider{maxLevel:maxLevel, ratePerSite:ratePerSite}
+    spider.downBytes = make(map[string]int)
+//    spider.lock = sync.RWMutex{}
+    return spider
+}
+
 func (spider Spider) Submit(start string) {
-	spider.downBytes = make(map[string]int)
-	num := runtime.NumCPU()
+//	num := runtime.NumCPU()
+    runtime.GOMAXPROCS(runtime.NumCPU())
+    num := 1
+    fmt.Println("cpu num", num)
 	urls := make(chan urlInfo, num*2)
 	urls <- urlInfo{0, start, 0}
 	endInfo := make(chan interface{})
@@ -45,28 +56,26 @@ func (spider Spider) Submit(start string) {
 func (spider Spider) download(urls chan urlInfo, endInfo chan<- interface{}) {
 
 	for info := range urls {
-		domain := getDomain(info.Url)
-		if spider.downBytes[domain] > spider.RatePerSite {
+		domain := getDomain(info.url)
+		if spider.downBytes[domain] > spider.ratePerSite {
 			fmt.Println("speed reached for ", domain, ", skip")
 			urls <- info
 		} else {
-			fmt.Println("downloading level ", info.Level, " url:", info.Url)
-			content, err := download(info.Url)
+			fmt.Println("downloading level ", info.level, " url:", info.url)
+			content, err := download(info.url)
 			if err != nil {
 				if info.retry < 3 {
 					info.retry++
 					urls <- info
 				}
-				fmt.Println(info.Url + " download failed")
+				fmt.Println(info.url + " download failed")
 				continue
 			}
 
+            spider.lock.Lock()
 			spider.downBytes[domain] += len(content)
+            spider.lock.Unlock()
 			go spider.parsePage(info, content, urls)
-			//urlList := spider.parsePage(info, content)
-			//for _, info := range urlList {
-			//urls <- info
-			//}
 		}
 	}
 	//close(urls)
@@ -76,21 +85,25 @@ func (spider Spider) download(urls chan urlInfo, endInfo chan<- interface{}) {
 }
 
 func (spider Spider) parsePage(parent urlInfo, content []byte, urls chan<- urlInfo) {
-	if parent.Level >= spider.MaxLevel {
+	if parent.level >= spider.maxLevel {
 		return
 	}
 	scontent := string(content)
-	//var splits = strings.Split(scontent, " ")
-	var splits = strings.FieldsFunc(scontent, filter)
+	var splits = strings.FieldsFunc(scontent, spliter)
 	for _, url := range splits {
 		if strings.Index(url, "http://") == 0 {
 			fmt.Println("found url:", url)
-			urls <- urlInfo{parent.Level + 1, url, 0}
+			urls <- urlInfo{parent.level + 1, url, 0}
 		}
 	}
-	destFile, err := os.Create("./" + string(parent.Level) + "/" + strings.Replace(parent.Url, "http://", "", 1))
+    fname := strings.Replace(parent.url, "http://", "", 1)
+    fname = strings.Replace(fname, "/", "_", -1)
+//    fname = string(parent.level) + "/" + fname
+    fname = fmt.Sprintf("%d/%s", parent.level, fname)
+	destFile, err := os.Create(fname)
+    fmt.Println("create file:", fname, " parent lvl:", parent.level)
 	if err != nil {
-		fmt.Println("failed to create file:", parent.Url)
+		fmt.Println("failed to create file:", fname)
 		fmt.Println(err)
 		return
 	}
@@ -98,8 +111,8 @@ func (spider Spider) parsePage(parent urlInfo, content []byte, urls chan<- urlIn
 	destFile.WriteString(scontent)
 }
 
-func filter(s rune) bool {
-	if s == ' ' || s == '\'' || s == ',' {
+func spliter(s rune) bool {
+	if s == ' ' || s == '\'' || s == ',' || s == '"'{
 		return true
 	}
 	return false
@@ -142,8 +155,10 @@ func (spider Spider) clearSpeedRecord(c <-chan time.Time) {
 	for {
 		<-c
 		fmt.Println("tick, clearSpeedRecord")
+        spider.lock.Lock()
 		for k, _ := range spider.downBytes {
 			spider.downBytes[k] = 0
 		}
+        spider.lock.Unlock()
 	}
 }
